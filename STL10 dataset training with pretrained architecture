@@ -1,0 +1,743 @@
+from torchvision import datasets
+import torchvision.transforms as transforms
+import os
+path2data="./data"
+if not os.path.exists(path2data):    
+    os.mkdir(path2data)
+datatransformer=transforms.Compose([transforms.ToTensor()])
+
+fashion_train=datasets.STL10(path2data,split='train',download=True,transform=datatransformer)
+fashion_test=datasets.STL10(path2data,split='test',download=True,transform=datatransformer)
+
+from sklearn.model_selection import StratifiedShuffleSplit
+sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=0)
+indices=list(range(len(fashion_test)))
+y_test0=[y for _,y in fashion_test]
+for test_index, val_index in sss.split(indices,y_test0):  
+    print("test:", test_index, "val:", val_index)   
+    print(len(val_index),len(test_index))
+from torch.utils.data import Subset
+val_ds=Subset(fashion_test,val_index)
+test_ds=Subset(fashion_test,test_index)
+
+import collections
+import numpy as np
+y_test=[y for _,y in fashion_test]
+y_val=[y for _,y in val_ds]
+counter_test=collections.Counter(y_test)
+counter_val=collections.Counter(y_val)
+print(counter_test)
+print(counter_val)
+
+from torchvision import utils	
+import matplotlib.pyplot as plt
+import numpy as np
+%matplotlib inline
+np.random.seed(0)
+import numpy as np
+
+meanRGB=[np.mean(x.numpy(),axis=(1,2)) for x,_ in fashion_train]
+stdRGB=[np.std(x.numpy(),axis=(1,2)) for x,_ in fashion_train]
+meanR=np.mean([m[0] for m in meanRGB])
+meanG=np.mean([m[1] for m in meanRGB])
+meanB=np.mean([m[2] for m in meanRGB])
+stdR=np.mean([s[0] for s in stdRGB])
+stdG=np.mean([s[1] for s in stdRGB])
+stdB=np.mean([s[2] for s in stdRGB])
+train_transformer = transforms.Compose([
+    transforms.RandomHorizontalFlip(p=0.5),  
+    transforms.RandomVerticalFlip(p=0.5),  
+    transforms.ToTensor(),
+    transforms.Normalize([meanR,meanG,meanB],[stdR,stdG,stdB])])
+test0_transformer = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize([meanR,meanG,meanB],[stdR,stdG,stdB])
+    ]) 
+fashion_train.transform=train_transformer
+fashion_test.transform=test0_transformer
+
+from torch.utils.data import DataLoader
+train_dl = DataLoader(fashion_train, batch_size=32, shuffle=True)
+val_dl = DataLoader(val_ds, batch_size=64, shuffle=False)
+
+from torchvision import models
+import torch 
+model_resnet18 = models.resnet18(pretrained=True)
+from torch import nn
+num_classes=10
+num_ftrs = model_resnet18.fc.in_features
+model_resnet18.fc = nn.Linear(num_ftrs, num_classes)
+device = torch.device("cpu:0")
+model_resnet18.to(device)
+
+for w in model_resnet18.parameters():
+    w=w.data.cpu()    
+    print(w.shape)    
+    break
+
+min_w=torch.min(w)
+w1 = (-1/(2*min_w))*w + 0.5
+print(torch.min(w1).item(),torch.max(w1).item())
+
+loss_func = nn.CrossEntropyLoss(reduction="sum")
+from torch import optim
+opt = optim.Adam(model_resnet18.parameters(), lr=1e-4)
+from torch.optim.lr_scheduler import CosineAnnealingLR
+lr_scheduler = CosineAnnealingLR(opt,T_max=2,eta_min=1e-5)
+
+def get_lr(opt):
+    for param_group in opt.param_groups:
+        return param_group['lr']
+
+current_lr=get_lr(opt)
+print('current lr={}'.format(current_lr))
+def metrics_batch(output, target):    
+    pred = output.argmax(dim=1, keepdim=True)       
+    corrects=pred.eq(target.view_as(pred)).sum().item()    
+    return corrects
+    
+def loss_batch(loss_func, output, target, opt=None):      
+    loss = loss_func(output, target)      
+    metric_b = metrics_batch(output,target)    
+    if opt is not None:        
+        opt.zero_grad()        
+        loss.backward()       
+        opt.step()    
+    return loss.item(), metric_b
+    
+def loss_epoch(model,loss_func,dataset_dl,sanity_check=False,opt=None):    
+    running_loss=0.0   
+    running_metric=0.0    
+    len_data=len(dataset_dl.dataset)
+    for xb, yb in dataset_dl:        
+        xb=xb.to(device)        
+        yb=yb.to(device)        
+        output=model(xb)        
+        loss_b,metric_b=loss_batch(loss_func, output, yb, opt)       
+        running_loss+=loss_b
+        if metric_b is not None:          
+             running_metric+=metric_b        
+        if sanity_check is True:           
+            break
+    loss=running_loss/float(len_data)
+    metric=running_metric/float(len_data)
+    return loss, metric
+
+def train_val(model, params):   
+    num_epochs=params["num_epochs"]   
+    loss_func=params["loss_func"]   
+    opt=params["optimizer"]    
+    train_dl=params["train_dl"]    
+    val_dl=params["val_dl"]    
+    sanity_check=params["sanity_check"]    
+    lr_scheduler=params["lr_scheduler"]    
+    path2weights=params["path2weights"]
+    loss_history={       
+        "train": [],       
+        "val": [],    }      
+    metric_history={        
+        "train": [],       
+        "val": [],    }
+    best_model_wts = copy.deepcopy(model.state_dict())  
+    best_loss=float('inf')
+    for epoch in range(num_epochs):      
+        current_lr=get_lr(opt)       
+        print('Epoch {}/{}, current lr={}'.format(epoch, num_epochs - 1, current_lr))              
+        model.train()        
+        train_loss, train_metric=loss_epoch(model,loss_func,train_dl,sanity_check,opt)       
+        loss_history["train"].append(train_loss)
+        metric_history["train"].append(train_metric)
+        model.eval()       
+
+        with torch.no_grad():          
+            val_loss, val_metric=loss_epoch(model,loss_func,val_dl,sanity_check)             
+        loss_history["val"].append(val_loss)      
+        metric_history["val"].append(val_metric)
+        if val_loss < best_loss:    
+            best_loss = val_loss         
+            best_model_wts = copy.deepcopy(model.state_dict())        
+            torch.save(model.state_dict(), path2weights)         
+            print("Copied best model weights!")
+        lr_scheduler.step()
+        print("train loss: %.6f, dev loss: %.6f, accuracy: %.2f" %(train_loss,val_loss,100*val_metric))
+        print("-"*10) 
+    model.load_state_dict(best_model_wts)    
+    return model, loss_history, metric_history
+    
+import copy
+loss_func = nn.CrossEntropyLoss(reduction="sum")
+opt = optim.Adam(model_resnet18.parameters(), lr=1e-4)
+lr_scheduler = CosineAnnealingLR(opt,T_max=5,eta_min=1e-6)
+params_train={
+ "num_epochs": 15,
+ "optimizer": opt,
+ "loss_func": loss_func,
+ "train_dl": train_dl,
+ "val_dl": val_dl,
+ "sanity_check": False,
+ "lr_scheduler": lr_scheduler,
+ "path2weights": "./models/resnet18_pretrained.pt",
+}
+
+resnet18_pretrained,loss_hist,metric_hist=train_val(model_resnet18,params_train)
+
+os.makedirs("./models", exist_ok=True)
+
+params_train={
+ "num_epochs": 15,
+ "optimizer": opt,
+ "loss_func": loss_func,
+ "train_dl": train_dl,
+ "val_dl": val_dl,
+ "sanity_check": False,
+ "lr_scheduler": lr_scheduler,
+ "path2weights": "./models/resnet18.pt",
+}
+
+model_resnet18,loss_hist,metric_hist=train_val(model_resnet18,params_train)
+
+batch size ==64
+
+Epoch 0/14, current lr=0.0001
+Copied best model weights!
+train loss: 0.991497, dev loss: 0.464251, accuracy: 84.62
+----------
+Epoch 1/14, current lr=9.05463412215599e-05
+Copied best model weights!
+train loss: 0.418738, dev loss: 0.383470, accuracy: 86.56
+----------
+Epoch 2/14, current lr=6.57963412215599e-05
+Copied best model weights!
+train loss: 0.289245, dev loss: 0.354633, accuracy: 88.44
+----------
+Epoch 3/14, current lr=3.5203658778440106e-05
+Copied best model weights!
+train loss: 0.210694, dev loss: 0.341978, accuracy: 88.44
+----------
+Epoch 4/14, current lr=1.0453658778440109e-05
+Copied best model weights!
+train loss: 0.160634, dev loss: 0.339037, accuracy: 88.62
+----------
+Epoch 5/14, current lr=1e-06
+train loss: 0.145237, dev loss: 0.340250, accuracy: 88.44
+----------
+Epoch 6/14, current lr=1.0453658778440097e-05
+Copied best model weights!
+train loss: 0.144051, dev loss: 0.337693, accuracy: 88.75
+----------
+Epoch 7/14, current lr=3.52036587784401e-05
+Copied best model weights!
+train loss: 0.131878, dev loss: 0.332226, accuracy: 89.50
+----------
+Epoch 8/14, current lr=6.57963412215599e-05
+train loss: 0.114413, dev loss: 0.376164, accuracy: 88.12
+----------
+Epoch 9/14, current lr=9.05463412215599e-05
+train loss: 0.093918, dev loss: 0.376465, accuracy: 87.81
+----------
+Epoch 10/14, current lr=0.0001
+train loss: 0.080438, dev loss: 0.401199, accuracy: 87.88
+----------
+Epoch 11/14, current lr=9.054634122155994e-05
+train loss: 0.070020, dev loss: 0.433440, accuracy: 87.25
+----------
+Epoch 12/14, current lr=6.579634122155991e-05
+train loss: 0.058477, dev loss: 0.385760, accuracy: 88.25
+----------
+Epoch 13/14, current lr=3.520365877844012e-05
+train loss: 0.039099, dev loss: 0.383962, accuracy: 88.69
+----------
+Epoch 14/14, current lr=1.0453658778440114e-05
+train loss: 0.027512, dev loss: 0.369320, accuracy: 89.38
+
+batch size==128
+
+poch 0/14, current lr=0.0001
+Copied best model weights!
+train loss: 1.179867, dev loss: 0.512802, accuracy: 83.81
+----------
+Epoch 1/14, current lr=9.05463412215599e-05
+Copied best model weights!
+train loss: 0.473260, dev loss: 0.421351, accuracy: 85.94
+----------
+Epoch 2/14, current lr=6.57963412215599e-05
+Copied best model weights!
+train loss: 0.306243, dev loss: 0.368438, accuracy: 87.00
+----------
+Epoch 3/14, current lr=3.5203658778440106e-05
+Copied best model weights!
+train loss: 0.238715, dev loss: 0.353076, accuracy: 87.75
+----------
+Epoch 4/14, current lr=1.0453658778440109e-05
+Copied best model weights!
+train loss: 0.190543, dev loss: 0.349139, accuracy: 88.31
+----------
+Epoch 5/14, current lr=1e-06
+Copied best model weights!
+train loss: 0.172554, dev loss: 0.346491, accuracy: 88.81
+----------
+Epoch 6/14, current lr=1.0453658778440097e-05
+train loss: 0.176843, dev loss: 0.346559, accuracy: 88.50
+----------
+Epoch 7/14, current lr=3.52036587784401e-05
+Copied best model weights!
+train loss: 0.164928, dev loss: 0.346368, accuracy: 88.50
+----------
+Epoch 8/14, current lr=6.57963412215599e-05
+train loss: 0.136605, dev loss: 0.348354, accuracy: 88.00
+----------
+Epoch 9/14, current lr=9.05463412215599e-05
+train loss: 0.119591, dev loss: 0.365606, accuracy: 87.75
+----------
+Epoch 10/14, current lr=0.0001
+train loss: 0.081965, dev loss: 0.358033, accuracy: 87.56
+----------
+Epoch 11/14, current lr=9.054634122155994e-05
+Copied best model weights!
+train loss: 0.060584, dev loss: 0.335717, accuracy: 88.44
+----------
+Epoch 12/14, current lr=6.579634122155991e-05
+train loss: 0.043637, dev loss: 0.341316, accuracy: 88.19
+----------
+Epoch 13/14, current lr=3.520365877844012e-05
+Copied best model weights!
+train loss: 0.033120, dev loss: 0.334437, accuracy: 89.06
+----------
+Epoch 14/14, current lr=1.0453658778440114e-05
+Copied best model weights!
+train loss: 0.024753, dev loss: 0.332097, accuracy: 88.81
+
+
+batch size==256
+
+Epoch 0/14, current lr=0.0001
+Copied best model weights!
+train loss: 1.389629, dev loss: 0.607631, accuracy: 78.56
+----------
+Epoch 1/14, current lr=9.05463412215599e-05
+Copied best model weights!
+train loss: 0.563624, dev loss: 0.449850, accuracy: 84.62
+----------
+Epoch 2/14, current lr=6.57963412215599e-05
+Copied best model weights!
+train loss: 0.379144, dev loss: 0.391566, accuracy: 86.44
+----------
+Epoch 3/14, current lr=3.5203658778440106e-05
+Copied best model weights!
+train loss: 0.303523, dev loss: 0.370982, accuracy: 87.44
+----------
+Epoch 4/14, current lr=1.0453658778440109e-05
+Copied best model weights!
+train loss: 0.263907, dev loss: 0.368464, accuracy: 87.69
+----------
+Epoch 5/14, current lr=1e-06
+train loss: 0.263711, dev loss: 0.368573, accuracy: 87.62
+----------
+Epoch 6/14, current lr=1.0453658778440097e-05
+Copied best model weights!
+train loss: 0.249016, dev loss: 0.364197, accuracy: 87.88
+----------
+Epoch 7/14, current lr=3.52036587784401e-05
+Copied best model weights!
+train loss: 0.225579, dev loss: 0.355322, accuracy: 87.88
+----------
+Epoch 8/14, current lr=6.57963412215599e-05
+Copied best model weights!
+train loss: 0.194370, dev loss: 0.340756, accuracy: 87.81
+----------
+Epoch 9/14, current lr=9.05463412215599e-05
+train loss: 0.153682, dev loss: 0.347947, accuracy: 87.62
+----------
+Epoch 10/14, current lr=0.0001
+Copied best model weights!
+train loss: 0.110619, dev loss: 0.339092, accuracy: 88.31
+----------
+Epoch 11/14, current lr=9.054634122155994e-05
+train loss: 0.086864, dev loss: 0.341913, accuracy: 88.62
+----------
+Epoch 12/14, current lr=6.579634122155991e-05
+Copied best model weights!
+train loss: 0.057187, dev loss: 0.329749, accuracy: 88.94
+----------
+Epoch 13/14, current lr=3.520365877844012e-05
+Copied best model weights!
+train loss: 0.043856, dev loss: 0.328627, accuracy: 88.62
+----------
+Epoch 14/14, current lr=1.0453658778440114e-05
+Copied best model weights!
+train loss: 0.040127, dev loss: 0.327065, accuracy: 88.62
+----------
+
+
+Batch size=512
+
+Epoch 0/14, current lr=0.0001
+Copied best model weights!
+train loss: 1.765956, dev loss: 0.871006, accuracy: 70.69
+----------
+Epoch 1/14, current lr=9.05463412215599e-05
+Copied best model weights!
+train loss: 0.795904, dev loss: 0.575371, accuracy: 81.00
+----------
+Epoch 2/14, current lr=6.57963412215599e-05
+Copied best model weights!
+train loss: 0.550527, dev loss: 0.492596, accuracy: 84.00
+----------
+Epoch 3/14, current lr=3.5203658778440106e-05
+Copied best model weights!
+train loss: 0.451224, dev loss: 0.457793, accuracy: 84.75
+----------
+Epoch 4/14, current lr=1.0453658778440109e-05
+Copied best model weights!
+train loss: 0.410246, dev loss: 0.449601, accuracy: 85.00
+----------
+Epoch 5/14, current lr=1e-06
+Copied best model weights!
+train loss: 0.393462, dev loss: 0.449544, accuracy: 85.06
+----------
+Epoch 6/14, current lr=1.0453658778440097e-05
+Copied best model weights!
+train loss: 0.387199, dev loss: 0.442700, accuracy: 85.50
+----------
+Epoch 7/14, current lr=3.52036587784401e-05
+Copied best model weights!
+train loss: 0.364601, dev loss: 0.424076, accuracy: 85.75
+----------
+Epoch 8/14, current lr=6.57963412215599e-05
+Copied best model weights!
+train loss: 0.311250, dev loss: 0.402521, accuracy: 86.31
+----------
+Epoch 9/14, current lr=9.05463412215599e-05
+Copied best model weights!
+train loss: 0.256416, dev loss: 0.382600, accuracy: 87.06
+----------
+Epoch 10/14, current lr=0.0001
+Copied best model weights!
+train loss: 0.189250, dev loss: 0.367585, accuracy: 87.50
+----------
+Epoch 11/14, current lr=9.054634122155994e-05
+Copied best model weights!
+train loss: 0.143538, dev loss: 0.362493, accuracy: 88.38
+----------
+Epoch 12/14, current lr=6.579634122155991e-05
+Copied best model weights!
+train loss: 0.108019, dev loss: 0.353752, accuracy: 88.50
+----------
+Epoch 13/14, current lr=3.520365877844012e-05
+Copied best model weights!
+train loss: 0.088113, dev loss: 0.350078, accuracy: 88.94
+----------
+Epoch 14/14, current lr=1.0453658778440114e-05
+Copied best model weights!
+train loss: 0.079329, dev loss: 0.347809, accuracy: 89.06
+----------
+Btach size ==32 lr 1e-05
+
+Epoch 0/14, current lr=1e-05
+Copied best model weights!
+train loss: 1.197555, dev loss: 0.812631, accuracy: 76.69
+----------
+Epoch 1/14, current lr=9.140576474687265e-06
+Copied best model weights!
+train loss: 0.860563, dev loss: 0.653689, accuracy: 79.56
+----------
+Epoch 2/14, current lr=6.890576474687264e-06
+Copied best model weights!
+train loss: 0.719641, dev loss: 0.582945, accuracy: 81.19
+----------
+Epoch 3/14, current lr=4.109423525312737e-06
+Copied best model weights!
+train loss: 0.652059, dev loss: 0.563046, accuracy: 81.00
+----------
+Epoch 4/14, current lr=1.8594235253127369e-06
+Copied best model weights!
+train loss: 0.601046, dev loss: 0.544049, accuracy: 82.69
+----------
+Epoch 5/14, current lr=1e-06
+Copied best model weights!
+train loss: 0.590899, dev loss: 0.533446, accuracy: 82.62
+----------
+Epoch 6/14, current lr=1.8594235253127365e-06
+Copied best model weights!
+train loss: 0.577206, dev loss: 0.515190, accuracy: 82.69
+----------
+Epoch 7/14, current lr=4.109423525312738e-06
+Copied best model weights!
+train loss: 0.556909, dev loss: 0.513101, accuracy: 82.94
+----------
+Epoch 8/14, current lr=6.890576474687266e-06
+Copied best model weights!
+train loss: 0.518019, dev loss: 0.468359, accuracy: 84.94
+----------
+Epoch 9/14, current lr=9.140576474687268e-06
+Copied best model weights!
+train loss: 0.470355, dev loss: 0.448316, accuracy: 85.25
+----------
+Epoch 10/14, current lr=1.0000000000000004e-05
+Copied best model weights!
+train loss: 0.427243, dev loss: 0.428305, accuracy: 85.62
+----------
+Epoch 11/14, current lr=9.14057647468727e-06
+Copied best model weights!
+train loss: 0.394470, dev loss: 0.402931, accuracy: 86.88
+----------
+Epoch 12/14, current lr=6.890576474687266e-06
+train loss: 0.361879, dev loss: 0.406899, accuracy: 86.38
+----------
+Epoch 13/14, current lr=4.109423525312739e-06
+Copied best model weights!
+train loss: 0.327560, dev loss: 0.389028, accuracy: 86.75
+----------
+Epoch 14/14, current lr=1.8594235253127377e-06
+Copied best model weights!
+train loss: 0.317511, dev loss: 0.383105, accuracy: 87.38
+
+
+batch size ==64   1e-05
+Epoch 0/14, current lr=1e-05
+Copied best model weights!
+train loss: 2.085770, dev loss: 1.509852, accuracy: 51.38
+----------
+Epoch 1/14, current lr=9.140576474687265e-06
+Copied best model weights!
+train loss: 1.397929, dev loss: 1.059690, accuracy: 68.88
+----------
+Epoch 2/14, current lr=6.890576474687264e-06
+Copied best model weights!
+train loss: 1.113570, dev loss: 0.871582, accuracy: 74.81
+----------
+Epoch 3/14, current lr=4.109423525312737e-06
+Copied best model weights!
+train loss: 0.960720, dev loss: 0.801654, accuracy: 76.44
+----------
+Epoch 4/14, current lr=1.8594235253127369e-06
+Copied best model weights!
+train loss: 0.901017, dev loss: 0.775045, accuracy: 77.56
+----------
+Epoch 5/14, current lr=1e-06
+Copied best model weights!
+train loss: 0.865255, dev loss: 0.746511, accuracy: 78.38
+----------
+Epoch 6/14, current lr=1.8594235253127365e-06
+Copied best model weights!
+train loss: 0.837966, dev loss: 0.737785, accuracy: 78.50
+----------
+Epoch 7/14, current lr=4.109423525312738e-06
+Copied best model weights!
+train loss: 0.804731, dev loss: 0.667980, accuracy: 79.88
+----------
+Epoch 8/14, current lr=6.890576474687266e-06
+Copied best model weights!
+train loss: 0.738618, dev loss: 0.600187, accuracy: 81.50
+----------
+Epoch 9/14, current lr=9.140576474687268e-06
+Copied best model weights!
+train loss: 0.651366, dev loss: 0.548967, accuracy: 82.88
+----------
+Epoch 10/14, current lr=1.0000000000000004e-05
+Copied best model weights!
+train loss: 0.566711, dev loss: 0.498296, accuracy: 83.69
+----------
+Epoch 11/14, current lr=9.14057647468727e-06
+Copied best model weights!
+train loss: 0.501814, dev loss: 0.471183, accuracy: 84.62
+----------
+Epoch 12/14, current lr=6.890576474687266e-06
+Copied best model weights!
+train loss: 0.461329, dev loss: 0.452670, accuracy: 85.19
+----------
+Epoch 13/14, current lr=4.109423525312739e-06
+Copied best model weights!
+train loss: 0.438603, dev loss: 0.440838, accuracy: 85.25
+----------
+Epoch 14/14, current lr=1.8594235253127377e-06
+train loss: 0.417120, dev loss: 0.442015, accuracy: 85.25
+----------
+
+
+128 v   1e-05
+
+
+Epoch 0/14, current lr=1e-05
+Copied best model weights!
+train loss: 2.304282, dev loss: 1.870276, accuracy: 37.19
+----------
+Epoch 1/14, current lr=9.140576474687265e-06
+Copied best model weights!
+train loss: 1.744202, dev loss: 1.390387, accuracy: 57.25
+----------
+Epoch 2/14, current lr=6.890576474687264e-06
+Copied best model weights!
+train loss: 1.410500, dev loss: 1.171471, accuracy: 65.94
+----------
+Epoch 3/14, current lr=4.109423525312737e-06
+Copied best model weights!
+train loss: 1.249692, dev loss: 1.051135, accuracy: 69.19
+----------
+Epoch 4/14, current lr=1.8594235253127369e-06
+Copied best model weights!
+train loss: 1.159673, dev loss: 1.031670, accuracy: 69.31
+----------
+Epoch 5/14, current lr=1e-06
+Copied best model weights!
+train loss: 1.127951, dev loss: 0.998441, accuracy: 70.69
+----------
+Epoch 6/14, current lr=1.8594235253127365e-06
+Copied best model weights!
+train loss: 1.087589, dev loss: 0.953806, accuracy: 72.38
+----------
+Epoch 7/14, current lr=4.109423525312738e-06
+Copied best model weights!
+train loss: 1.034324, dev loss: 0.895075, accuracy: 74.25
+----------
+Epoch 8/14, current lr=6.890576474687266e-06
+Copied best model weights!
+train loss: 0.953576, dev loss: 0.818471, accuracy: 76.25
+----------
+Epoch 9/14, current lr=9.140576474687268e-06
+Copied best model weights!
+train loss: 0.830523, dev loss: 0.716725, accuracy: 78.94
+----------
+Epoch 10/14, current lr=1.0000000000000004e-05
+Copied best model weights!
+train loss: 0.732885, dev loss: 0.644060, accuracy: 80.94
+----------
+Epoch 11/14, current lr=9.14057647468727e-06
+Copied best model weights!
+train loss: 0.652977, dev loss: 0.594435, accuracy: 82.00
+----------
+Epoch 12/14, current lr=6.890576474687266e-06
+Copied best model weights!
+train loss: 0.596650, dev loss: 0.563695, accuracy: 82.75
+----------
+Epoch 13/14, current lr=4.109423525312739e-06
+Copied best model weights!
+train loss: 0.553897, dev loss: 0.542604, accuracy: 83.38
+----------
+Epoch 14/14, current lr=1.8594235253127377e-06
+train loss: 0.543366, dev loss: 0.548608, accuracy: 83.19
+----------
+
+256   1e-05
+
+Epoch 0/14, current lr=1e-05
+Copied best model weights!
+train loss: 2.370600, dev loss: 2.060631, accuracy: 26.81
+----------
+Epoch 1/14, current lr=9.140576474687265e-06
+Copied best model weights!
+train loss: 1.947928, dev loss: 1.681177, accuracy: 42.94
+----------
+Epoch 2/14, current lr=6.890576474687264e-06
+Copied best model weights!
+train loss: 1.679598, dev loss: 1.466636, accuracy: 53.31
+----------
+Epoch 3/14, current lr=4.109423525312737e-06
+Copied best model weights!
+train loss: 1.524340, dev loss: 1.360798, accuracy: 59.50
+----------
+Epoch 4/14, current lr=1.8594235253127369e-06
+Copied best model weights!
+train loss: 1.457014, dev loss: 1.322296, accuracy: 61.00
+----------
+Epoch 5/14, current lr=1e-06
+Copied best model weights!
+train loss: 1.431206, dev loss: 1.300190, accuracy: 62.12
+----------
+Epoch 6/14, current lr=1.8594235253127365e-06
+Copied best model weights!
+train loss: 1.394192, dev loss: 1.261285, accuracy: 63.69
+----------
+Epoch 7/14, current lr=4.109423525312738e-06
+Copied best model weights!
+train loss: 1.337664, dev loss: 1.181101, accuracy: 66.00
+----------
+Epoch 8/14, current lr=6.890576474687266e-06
+Copied best model weights!
+train loss: 1.238327, dev loss: 1.063903, accuracy: 70.06
+----------
+Epoch 9/14, current lr=9.140576474687268e-06
+Copied best model weights!
+train loss: 1.100302, dev loss: 0.944712, accuracy: 74.31
+----------
+Epoch 10/14, current lr=1.0000000000000004e-05
+Copied best model weights!
+train loss: 0.981858, dev loss: 0.843374, accuracy: 77.19
+----------
+Epoch 11/14, current lr=9.14057647468727e-06
+Copied best model weights!
+train loss: 0.889394, dev loss: 0.765344, accuracy: 78.81
+----------
+Epoch 12/14, current lr=6.890576474687266e-06
+Copied best model weights!
+train loss: 0.811256, dev loss: 0.718215, accuracy: 79.88
+----------
+Epoch 13/14, current lr=4.109423525312739e-06
+Copied best model weights!
+train loss: 0.771104, dev loss: 0.698103, accuracy: 80.56
+----------
+Epoch 14/14, current lr=1.8594235253127377e-06
+Copied best model weights!
+train loss: 0.752965, dev loss: 0.688346, accuracy: 80.69
+----------
+
+512    1e-05
+Epoch 0/14, current lr=1e-05
+Copied best model weights!
+train loss: 2.612108, dev loss: 2.508450, accuracy: 16.81
+----------
+Epoch 1/14, current lr=9.140576474687265e-06
+Copied best model weights!
+train loss: 2.330511, dev loss: 2.145985, accuracy: 23.38
+----------
+Epoch 2/14, current lr=6.890576474687264e-06
+Copied best model weights!
+train loss: 2.116218, dev loss: 1.966785, accuracy: 29.31
+----------
+Epoch 3/14, current lr=4.109423525312737e-06
+Copied best model weights!
+train loss: 1.980978, dev loss: 1.879951, accuracy: 33.06
+----------
+Epoch 4/14, current lr=1.8594235253127369e-06
+Copied best model weights!
+train loss: 1.907868, dev loss: 1.844220, accuracy: 35.06
+----------
+Epoch 5/14, current lr=1e-06
+Copied best model weights!
+train loss: 1.878698, dev loss: 1.828802, accuracy: 35.94
+----------
+Epoch 6/14, current lr=1.8594235253127365e-06
+Copied best model weights!
+train loss: 1.851779, dev loss: 1.784448, accuracy: 38.69
+----------
+Epoch 7/14, current lr=4.109423525312738e-06
+Copied best model weights!
+train loss: 1.802157, dev loss: 1.693232, accuracy: 43.00
+----------
+Epoch 8/14, current lr=6.890576474687266e-06
+Copied best model weights!
+train loss: 1.691145, dev loss: 1.550765, accuracy: 50.06
+----------
+Epoch 9/14, current lr=9.140576474687268e-06
+Copied best model weights!
+train loss: 1.555820, dev loss: 1.388077, accuracy: 57.44
+----------
+Epoch 10/14, current lr=1.0000000000000004e-05
+Copied best model weights!
+train loss: 1.416301, dev loss: 1.241090, accuracy: 62.62
+----------
+Epoch 11/14, current lr=9.14057647468727e-06
+Copied best model weights!
+train loss: 1.281996, dev loss: 1.139234, accuracy: 66.12
+----------
+Epoch 12/14, current lr=6.890576474687266e-06
+Copied best model weights!
+train loss: 1.202160, dev loss: 1.072913, accuracy: 68.62
+----------
+Epoch 13/14, current lr=4.109423525312739e-06
+Copied best model weights!
+train loss: 1.135311, dev loss: 1.043552, accuracy: 69.62
+----------
+Epoch 14/14, current lr=1.8594235253127377e-06
+Copied best model weights!
+train loss: 1.122447, dev loss: 1.029006, accuracy: 70.50
